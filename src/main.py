@@ -1,11 +1,5 @@
-import websocket
-import json
-from api.sockets import KrakenL1Socket
-import time
+from api.sockets import KrakenL3Socket
 
 
-l1 = KrakenL1Socket('BTC/USD')
-
+l1 = KrakenL3Socket('BTC/USD', depth=10)
 l1.connect()
-
-
