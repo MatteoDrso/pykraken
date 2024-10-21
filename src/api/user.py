@@ -5,10 +5,13 @@ import hmac
 import urllib.request
 import json
 import os
+
 from dotenv import load_dotenv
 
+from api.errors import APIKeyError
 
-def get_token() -> str:
+
+def get_token(api_key: str = None, api_secret_key: str = None) -> str:
     """
     Get the Kraken Token associated with the user with the API keys provided in the .env file.
 
@@ -16,16 +19,24 @@ def get_token() -> str:
     Source: edited from: https://support.kraken.com/hc/en-us/articles/360034437672-How-to-retrieve-a-WebSocket-authentication-token-Example-code-in-Python-3
     """
 
-    load_dotenv()
-    api_key = os.getenv('API_KEY')
-    api_private_key = os.getenv('API_PRIVATE_KEY')
+    if api_key == None or api_secret_key == None:
+        
+        load_dotenv()
+        api_key = os.getenv('API_KEY')
+        api_secret_key = os.getenv('API_SECRET_KEY')
+
+        if  api_key == 'your-api-key' or api_secret_key == 'your-api-secret-key':
+
+            raise APIKeyError("Invalid API key configuration. " +
+                              "Either pass both api keys as function arguments " +
+                              "or put them both in the .env file.")
 
     api_path = '/0/private/GetWebSocketsToken'
     api_nonce = str(int(time.time()*1000))
     api_post = 'nonce=' + api_nonce
 
     api_sha256 = hashlib.sha256(api_nonce.encode('utf-8') + api_post.encode('utf-8'))
-    api_hmac = hmac.new(base64.b64decode(api_private_key), api_path.encode('utf-8') + api_sha256.digest(), hashlib.sha512)
+    api_hmac = hmac.new(base64.b64decode(api_secret_key), api_path.encode('utf-8') + api_sha256.digest(), hashlib.sha512)
 
     api_signature = base64.b64encode(api_hmac.digest())
 
