@@ -1,9 +1,18 @@
+import api.tickers as tickers
+from api.errors import InvalidChecksumError
+from api.user import get_token
 
 import websocket
 import threading
-import api.tickers as tickers
-import warnings
 import json
+from zlib import crc32
+import asyncio
+from decimal import Decimal
+
+import warnings
+
+from sortedcontainers import SortedDict
+
 
 
 KRAKEN_WS_AUTH_URL = 'wss://ws-auth.kraken.com/v2'
@@ -95,39 +104,37 @@ class KrakenSocket:
         self.ws.run_forever()
 
 
-    def _ensure_pair_validity(self, pairs: list[str] | str, on_invalid: str = 'drop') -> int | list[str]:
+    def _ensure_pair_validity(self, pair: str, on_invalid: str = 'drop') -> list[str]:
         """
         Ensure the validity of the passed pair list `pairs` so that they
         coincide with the formatting of Kraken.
         """
         
-        ret = list()
+        if type(pair) != str:
+            #TODO: support multiple pairs.
+            raise TypeError(f"The pair passed have to be a single string, not {type(pair)}.",
+                             "If you want to have multiple data streams, please use multiple sockets.")
 
-        if type(pairs) == str:
-            pairs = [pairs]
-        elif type(pairs) != list:
-            raise TypeError(f"The pairs passed have to be a list of strings or a single string, not {type(pairs)}")
-
-        for pair in pairs:
-            if pair in tickers.KRAKEN_PAIRS:
-                ret.append(pair)
-            else:
-                match on_invalid:
-                    case 'drop':
-                        warnings.warn(f"{pair} not in api.tickers, you might have to update that list.")
-                    case 'raise':
-                        raise KeyError(f"{pair} not in api.tickers, you might have to update that list.")
-
-        return ret
+        if pair in tickers.KRAKEN_PAIRS:
+            return [pair]
+        else:
+            match on_invalid:
+                case 'drop':
+                    warnings.warn(f"{pair} not in api.tickers, you might have to update that list.")
+                case 'raise':
+                    raise KeyError(f"{pair} not in api.tickers, you might have to update that list.")
 
 
-    def _json_subcribe_message(self, params: dict) -> str:
+    def _json_subcribe_message(self, params: dict, token: str = None) -> str:
         """
         Create json message to subscribe to a Kraken API Socket.
         """
         
         json_message = {'method':'subscribe'}
         json_message['params'] = params
+
+        if token != None:
+            json_message['params']['token'] = token
 
         return json.dumps(json_message, indent=4)
 
@@ -143,10 +150,10 @@ class KrakenL1Socket(KrakenSocket):
     Source: https://docs.kraken.com/api/docs/websocket-v2/ticker
     """
 
-    def __init__(self, symbols: list[str] | str, high_freq: bool = False,
+    def __init__(self, symbol: str, high_freq: bool = False,
                  on_invalid: str = 'raise', debug: bool = False):
 
-        self.symbols = self._ensure_pair_validity(symbols, on_invalid=on_invalid)
+        self.symbol = self._ensure_pair_validity(symbol, on_invalid=on_invalid)
         self.event_trigger = 'trades' if high_freq else 'bbo'
 
         super().__init__(auth=False, debug=debug)
@@ -158,7 +165,7 @@ class KrakenL1Socket(KrakenSocket):
         """
         Handle the closing of the websocket.
         """
-        
+
         print("Closing the Kraken L1 socket...")
         print(f"{self.count} ticker messages received and handled.")
 
@@ -177,25 +184,25 @@ class KrakenL1Socket(KrakenSocket):
 
         Handle and parse the incoming server response `message`.
         """
+
         response = json.loads(message)
         
         if response.get('channel', "") == 'status' or response.get('channel', "") == 'heartbeat':
             pass
         else:
-            if self.count == 0: # subscription ack.
+            if self.count == 0: # skip subscription ack.
                 pass
             else:
                 if (channel := response.get('channel', "")) != 'ticker':
                     warnings.warn(f"expected channel: ticker, got {channel} instead.")
                 else:
-                    for i, sym in enumerate(self.symbols):
-                        data = response['data'][i]
-                        print(
-                            f"{sym} ${data['last']}, {data['change']} ({data['change_pct']}%)\n" +
-                            f"bid: {data['bid']} ({data['bid_qty']})\n" +
-                            f"ask: {data['ask']} ({data['ask_qty']})\n" +
-                            f"vwap: {data['vwap']}"
-                        )
+                    data = response['data'][0]
+                    print(
+                        f"{self.symbols} ${data['last']}, {data['change']} ({data['change_pct']}%)\n" +
+                        f"bid: {data['bid']} ({data['bid_qty']})\n" +
+                        f"ask: {data['ask']} ({data['ask_qty']})\n" +
+                        f"vwap: {data['vwap']}"
+                    )
             self.count += 1
 
     
@@ -206,7 +213,7 @@ class KrakenL1Socket(KrakenSocket):
 
         subscription_params = {
             'channel': 'ticker',
-            'symbol': self.symbols,
+            'symbol': self.symbol,
             'event_trigger': self.event_trigger,
         }
 
@@ -226,32 +233,169 @@ class KrakenL2Socket(KrakenSocket):
 
     BOOK_DEPTHS = [10, 25, 100, 500, 1000]
 
-    def __init__(self, symbols: list[str] | str, depth: int = 10,
-                 on_invalid: str = 'raise', debug: bool = False):
+    def __init__(self, symbol: str, depth: int = 10,
+                 checksum_freq: int = 10, on_invalid: str = 'raise',
+                 debug: bool = False):
 
-        self.symbols = self._ensure_pair_validity(symbols, on_invalid=on_invalid)
-        self.event_trigger = 'trades' if high_freq else 'bbo'
+        self.symbol = self._ensure_pair_validity(symbol, on_invalid=on_invalid)
+        
+        self.bids = SortedDict()
+        self.asks = SortedDict()
+
+        if depth not in KrakenL2Socket.BOOK_DEPTHS:
+            raise ValueError(f"The book depth has to be in {KrakenL2Socket.BOOK_DEPTHS}.")
+        
+        self.depth = depth
 
         super().__init__(auth=False, debug=debug)
 
+        self.checksum_freq = checksum_freq
         self.count = 0
 
 
     def _on_close(self, ws: websocket.WebSocket, close_status_code: int, close_msg: str):
-        pass
+        """
+        Handle the closing of the websocket.
+        """
+
+        print("Closing the Kraken L2 socket...")
+        print(f"{self.count} ticker messages received and handled.")
 
 
     def _on_error(self, ws: websocket.WebSocket, error: str):
-        pass
+        """
+        Handle the error of the websocket.
+        """
+        
+        print(f"\nReceived error: {error}\n")
 
 
     def _on_message(self, ws: websocket.WebSocket, message: str):
-        pass
+        """
+        **This function provides the main interface to parse the responses from the server.**
+
+        Handle and parse the incoming server response `message`.
+        """
+
+        response = json.loads(message)
+
+        #skip status and hearbeat messages
+        if response.get('channel', "") == 'status' or response.get('channel', "") == 'heartbeat':
+            pass
+
+        else:
+            if self.count == 0: # skip subscription ack.
+                pass
+
+            else:
+                #logic to maintain the order book.
+                data = response['data'][0]
+                checksum = data['checksum']
+
+                if response['type'] == 'snapshot':
+                    self.bids, self.asks = self._create_book_from_snapshot(response)                   
+                
+                else:
+                    bids = data['bids']
+                    asks = data['asks']
+
+                    for bid in bids:
+                        if bid['qty'] == 0:
+                            del self.bids[bid['price']]
+                        else:
+                            self.bids[bid['price']] = bid['qty'] 
+                    
+                    for ask in asks:
+                        if ask['qty'] == 0:
+                            del self.asks[ask['price']]
+                        else:
+                            self.asks[ask['price']] = ask['qty'] 
+
+                    asks_len = len(self.asks)
+                    bids_len = len(self.bids)
+                    overflow_asks = asks_len - self.depth
+                    overflow_bids = bids_len - self.depth
+
+                    for ask_price in reversed(self.asks):
+                        if overflow_asks == 0:
+                            break
+                        overflow_asks -= 1
+                        del self.asks[ask_price]
+                 
+                    for bid_price in self.bids:
+                        if overflow_bids == 0:
+                            break
+                        overflow_bids -= 1
+                        del self.bids[bid_price]
+
+
+                if self.count % self.checksum_freq == 0:
+
+                    if not self._verify_checksum(checksum):
+                        #TODO: at this point you would probably want to rebuild the book, instead of throwing an Error.
+                        raise InvalidChecksumError("The checksum verification failed.") 
+                
+            self.count += 1
 
     
     def _on_open(self, ws: websocket.WebSocket):
-        pass    
+        """
+        Handles the opening of the socket and the sending of the subscription request.
+        """
 
+        print("Kraken L2 Socket opened.")
+
+        subscription_params = {
+            'channel': 'book',
+            'symbol': self.symbol,
+            'depth': self.depth,
+        }
+
+        self.ws.send(self._json_subcribe_message(subscription_params))          
+
+
+    def _create_book_from_snapshot(self, snapshot: dict) -> tuple[SortedDict, SortedDict]:
+        """
+        Create two sorted dictionaries from the json response snapshot.
+        """
+
+        data = snapshot['data'][0]
+
+        bids = SortedDict({bid['price']:bid['qty'] for bid in data['bids']})
+        asks = SortedDict({ask['price']:ask['qty'] for ask in data['asks']})
+
+        return bids, asks
+
+    
+    def _verify_checksum(self, checksum: int) -> bool:
+        """"
+        Verify if the checksum of the local books coincides with the 
+        checksum `checksum` provided by the Kraken API.
+        """
+
+        checksum_str = ""
+
+        for price, qty in list(self.asks.items())[:10]:
+
+            price = f"{price:.1f}"
+            qty = f"{qty:.8f}"
+
+            price = price.replace('.', '').lstrip('0')
+            qty = qty.replace('.', '').lstrip('0')
+
+            checksum_str += price + qty
+
+        for price, qty in list(reversed(self.bids.items()))[:10]:
+
+            price = f"{price:.1f}"
+            qty = f"{qty:.8f}"
+
+            price = price.replace('.', '').lstrip('0')
+            qty = qty.replace('.', '').lstrip('0')
+
+            checksum_str += price + qty
+
+        return checksum == crc32(checksum_str.encode('utf-8'))
 
 
 
@@ -266,20 +410,174 @@ class KrakenL3Socket(KrakenSocket):
     Source: https://docs.kraken.com/api/docs/websocket-v2/level3
     """
 
-    def __init__(self, ):
-        pass
+    BOOK_DEPTHS = [10, 100, 1000]
+
+    def __init__(self, symbol: str, depth: int = 10,
+                 on_invalid: str = 'raise', debug: bool = False,
+                 checksum_freq: int = 10,
+                 api_key: str = None, api_secret_key: str = None):
+
+        self.symbol = self._ensure_pair_validity(symbol, on_invalid=on_invalid)
+        self.token = get_token(api_key, api_secret_key)
+
+        self.bids = SortedDict()
+        self.asks = SortedDict()
+
+        if depth not in KrakenL3Socket.BOOK_DEPTHS:
+            raise ValueError(f"The book depth has to be in {KrakenL3Socket.BOOK_DEPTHS}.")
+        
+        self.depth = depth
+    
+        super().__init__(auth=True, debug=debug)
+
+        self.count = 0
+        self.checksum_freq = checksum_freq
 
 
     def _on_close(self, ws):
-        pass
+        """
+        Handle the closing of the websocket.
+        """
+
+        print("Closing the Kraken L3 socket...")
+        print(f"{self.count} ticker messages received and handled.")
+
 
     def _on_error(self, ws, error):
-        pass
+        """
+        Handle the error of the websocket.
+        """
+        
+        print(f"\nReceived error: {error}\n")
+
 
     def _on_message(self, ws, message):
-        pass
+        """
+        **This function provides the main interface to parse the responses from the server.**
+
+        Handle and parse the incoming server response `message`.
+        """
+
+        response = json.loads(message)
+        print(response)
+
+        #skip status and hearbeat messages
+        if response.get('channel', "") == 'status' or response.get('channel', "") == 'heartbeat':
+            pass
+
+        else:
+            if self.count == 0: # skip subscription ack.
+                pass
+
+            else:
+                #logic to maintain the order book.
+                data = response['data'][0]
+                checksum = data['checksum']
+
+                if response['type'] == 'snapshot':
+                    self.bids, self.asks = self._create_book_from_snapshot(response)                   
+
+                else:
+                    #nyi
+                    pass
+
+                if self.count % self.checksum_freq == 0:
+                
+                    if not self._verify_checksum(checksum):
+                        #TODO: at this point you would probably want to rebuild the book, instead of throwing an Error.
+                        raise InvalidChecksumError("The checksum verification failed.") 
+                
+            self.count += 1
     
+
     def _on_open(self, ws):
-        pass
+        """
+        Handles the opening of the socket and the sending of the subscription request.
+        """
+
+        print("Kraken L3 Socket opened.")
+
+        subscription_params = {
+            'channel': 'level3',
+            'symbol': self.symbol,
+            'depth': self.depth,
+        }
+
+        self.ws.send(self._json_subcribe_message(subscription_params, token=self.token))         
+
+    
+    def _create_book_from_snapshot(self, snapshot: str) -> tuple[SortedDict, SortedDict]:
+        """
+        Create two sorted dictionaries from the json response snapshot.
+        """
+
+        data = snapshot['data'][0]
+
+        asks = SortedDict()
+        bids = SortedDict()
+
+        price = -1
+        orders = []
+
+        for bid in data['bids']:
+
+            curr_price, curr_order = bid['limit_price'], bid['order_qty']
+
+            if price != curr_price:
+                bids[price] = orders
+                price = curr_price
+                orders = [curr_order]
+
+            else:
+                orders.append(curr_order)
+        
+        bids[price] = orders
+
+        for ask in data['asks']:
+
+            curr_price, curr_order = ask['limit_price'], ask['order_qty']
+
+            if price != curr_price:
+                asks[price] = orders
+                price = curr_price
+                orders = [curr_order]
+
+            else:
+                orders.append(curr_order)
+        
+        bids[price] = orders
+
+        return bids, asks
+
+
+    def _verify_checksum(self, checksum: int) -> bool:
+        """"
+        Verify if the checksum of the local books coincides with the 
+        checksum `checksum` provided by the Kraken API.
+        """
+
+        checksum_str = ""
+
+        for price, qty in list(self.asks.items())[:10]:
+
+            price = f"{price:.1f}"
+            qty = f"{qty:.8f}"
+
+            price = price.replace('.', '').lstrip('0')
+            qty = qty.replace('.', '').lstrip('0')
+
+            checksum_str += price + qty
+
+        for price, qty in list(reversed(self.bids.items()))[:10]:
+
+            price = f"{price:.1f}"
+            qty = f"{qty:.8f}"
+
+            price = price.replace('.', '').lstrip('0')
+            qty = qty.replace('.', '').lstrip('0')
+
+            checksum_str += price + qty
+
+        return checksum == crc32(checksum_str.encode('utf-8'))
 
 
