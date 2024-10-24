@@ -24,6 +24,8 @@ This package only requires 3 external modules, to install them use:
 ```shell
 pip install -r requirements.txt
 ```
+Add your Kraken API keys into the ``.env.example`` file and rename it to ``.env``. To create API keys see here: https://support.kraken.com/hc/en-us/articles/360000919966-How-to-create-an-API-key.
+
 To use the sockets you need to create a socket like this:
 ```python
 from api.sockets import KrakenL3Socket
