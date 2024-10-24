@@ -6,8 +6,6 @@ import websocket
 import threading
 import json
 from zlib import crc32
-import asyncio
-from decimal import Decimal
 
 import warnings
 
@@ -133,10 +131,21 @@ class KrakenSocket:
         json_message = {'method':'subscribe'}
         json_message['params'] = params
 
-        if token != None:
+        if token:
             json_message['params']['token'] = token
 
-        return json.dumps(json_message, indent=4)
+        return json.dumps(json_message)
+
+
+    def _format_kraken_str(self, x: float, precision: int) -> str:
+        """
+        Format a float `x` with given precision `precision` to Kraken API standards.
+        """
+
+        x = f"{x:.{precision}f}"
+        x = x.replace('.', '').lstrip('0')
+
+        return x
 
 
 
@@ -279,6 +288,7 @@ class KrakenL2Socket(KrakenSocket):
 
         response = json.loads(message)
 
+        #LOGIC TO MAINTAIN THE ORDER BOOK
         #skip status and hearbeat messages
         if response.get('channel', "") == 'status' or response.get('channel', "") == 'heartbeat':
             pass
@@ -288,9 +298,7 @@ class KrakenL2Socket(KrakenSocket):
                 pass
 
             else:
-                #logic to maintain the order book.
                 data = response['data'][0]
-                checksum = data['checksum']
 
                 if response['type'] == 'snapshot':
                     self.bids, self.asks = self._create_book_from_snapshot(response)                   
@@ -311,10 +319,9 @@ class KrakenL2Socket(KrakenSocket):
                         else:
                             self.asks[ask['price']] = ask['qty'] 
 
-                    asks_len = len(self.asks)
-                    bids_len = len(self.bids)
-                    overflow_asks = asks_len - self.depth
-                    overflow_bids = bids_len - self.depth
+
+                    overflow_asks = len(self.asks) - self.depth
+                    overflow_bids = len(self.bids) - self.depth
 
                     for ask_price in reversed(self.asks):
                         if overflow_asks == 0:
@@ -330,6 +337,8 @@ class KrakenL2Socket(KrakenSocket):
 
 
                 if self.count % self.checksum_freq == 0:
+
+                    checksum = data['checksum']
 
                     if not self._verify_checksum(checksum):
                         #TODO: at this point you would probably want to rebuild the book, instead of throwing an Error.
@@ -377,22 +386,14 @@ class KrakenL2Socket(KrakenSocket):
 
         for price, qty in list(self.asks.items())[:10]:
 
-            price = f"{price:.1f}"
-            qty = f"{qty:.8f}"
-
-            price = price.replace('.', '').lstrip('0')
-            qty = qty.replace('.', '').lstrip('0')
-
+            price = self._format_kraken_str(price, 1)
+            qty = self._format_kraken_str(qty, 8)
             checksum_str += price + qty
 
         for price, qty in list(reversed(self.bids.items()))[:10]:
 
-            price = f"{price:.1f}"
-            qty = f"{qty:.8f}"
-
-            price = price.replace('.', '').lstrip('0')
-            qty = qty.replace('.', '').lstrip('0')
-
+            price = self._format_kraken_str(price, 1)
+            qty = self._format_kraken_str(qty, 8)
             checksum_str += price + qty
 
         return checksum == crc32(checksum_str.encode('utf-8'))
@@ -434,7 +435,7 @@ class KrakenL3Socket(KrakenSocket):
         self.checksum_freq = checksum_freq
 
 
-    def _on_close(self, ws):
+    def _on_close(self, ws: websocket.WebSocket, close_status_code: int, close_msg: str):
         """
         Handle the closing of the websocket.
         """
@@ -443,15 +444,15 @@ class KrakenL3Socket(KrakenSocket):
         print(f"{self.count} ticker messages received and handled.")
 
 
-    def _on_error(self, ws, error):
+    def _on_error(self, ws: websocket.WebSocket, error: str):
         """
         Handle the error of the websocket.
         """
-        
+
         print(f"\nReceived error: {error}\n")
 
 
-    def _on_message(self, ws, message):
+    def _on_message(self, ws: websocket.WebSocket, message: str):
         """
         **This function provides the main interface to parse the responses from the server.**
 
@@ -459,8 +460,8 @@ class KrakenL3Socket(KrakenSocket):
         """
 
         response = json.loads(message)
-        print(response)
 
+        #LOGIC TO MAINTAIN THE ORDER BOOK
         #skip status and hearbeat messages
         if response.get('channel', "") == 'status' or response.get('channel', "") == 'heartbeat':
             pass
@@ -470,19 +471,100 @@ class KrakenL3Socket(KrakenSocket):
                 pass
 
             else:
-                #logic to maintain the order book.
                 data = response['data'][0]
                 checksum = data['checksum']
 
                 if response['type'] == 'snapshot':
-                    self.bids, self.asks = self._create_book_from_snapshot(response)                   
+                    self.bids, self.asks = self._create_book_from_snapshot(response)                  
 
                 else:
-                    #nyi
-                    pass
+                    bid_orders = data['bids']
+                    ask_orders = data['asks']
+
+                    for bid_order in bid_orders:
+
+                        oid = bid_order['order_id']
+                        oprice = bid_order['limit_price']
+                        oqty = bid_order['order_qty']
+
+                        match(bid_order['event']):
+
+                            case 'add':
+                                oprice_level = self.bids.get(oprice, None)
+
+                                if not oprice_level:
+                                    self.bids[oprice] = {oid: oqty}
+                                else:
+                                    self.bids[oprice][oid] = oqty
+
+                            case 'modify':
+                                self.bids[oprice][oid] = oqty
+
+                            case 'delete':
+                                del self.bids[oprice][oid]
+
+                                if not self.bids[oprice]:
+                                    del self.bids[oprice]
+
+                            case _:
+                                raise ValueError("the order field 'event' should be ",
+                                        f"'add', 'modify' or 'delete, but is {ask_order['event']}")
+                    
+
+                    for ask_order in ask_orders:
+
+                        oid = ask_order['order_id']
+                        oprice = ask_order['limit_price']
+                        oqty = ask_order['order_qty']
+
+                        match(ask_order['event']):
+
+                            case 'add':
+                                oprice_level = self.asks.get(oprice, None)
+
+                                if not oprice_level:
+                                    self.asks[oprice] = {oid: oqty}
+                                else:
+                                    self.asks[oprice][oid] = oqty
+
+                            case 'modify':
+                                self.asks[oprice][oid] = oqty
+
+                            case 'delete':
+                                del self.asks[oprice][oid]
+
+                                if not self.asks[oprice]:
+                                    del self.asks[oprice]
+
+                            case _:
+                                raise ValueError("the order field 'event' should be ",
+                                        f"'add', 'modify' or 'delete, but is {ask_order['event']}")
+
+
+                    overflow_asks = len(self.asks) - self.depth
+                    overflow_bids = len(self.bids) - self.depth
+
+                    for ask_price in reversed(self.asks):
+
+                        if overflow_asks == 0:
+                            break
+
+                        overflow_asks -= 1
+                        del self.asks[ask_price]
+                 
+                    for bid_price in self.bids:
+
+                        if overflow_bids == 0:
+                            break
+
+                        overflow_bids -= 1
+                        del self.bids[bid_price]
+
 
                 if self.count % self.checksum_freq == 0:
                 
+                    checksum = data['checksum']
+
                     if not self._verify_checksum(checksum):
                         #TODO: at this point you would probably want to rebuild the book, instead of throwing an Error.
                         raise InvalidChecksumError("The checksum verification failed.") 
@@ -490,7 +572,7 @@ class KrakenL3Socket(KrakenSocket):
             self.count += 1
     
 
-    def _on_open(self, ws):
+    def _on_open(self, ws: websocket.WebSocket):
         """
         Handles the opening of the socket and the sending of the subscription request.
         """
@@ -508,7 +590,7 @@ class KrakenL3Socket(KrakenSocket):
     
     def _create_book_from_snapshot(self, snapshot: str) -> tuple[SortedDict, SortedDict]:
         """
-        Create two sorted dictionaries from the json response snapshot.
+        Create two sorted dictionaries (bids and asks) from the json response snapshot.
         """
 
         data = snapshot['data'][0]
@@ -517,35 +599,42 @@ class KrakenL3Socket(KrakenSocket):
         bids = SortedDict()
 
         price = -1
-        orders = []
+        orders = {}
 
         for bid in data['bids']:
 
-            curr_price, curr_order = bid['limit_price'], bid['order_qty']
+            curr_price = bid['limit_price']
+            curr_qty = bid['order_qty']
+            curr_id = bid['order_id']
 
             if price != curr_price:
                 bids[price] = orders
                 price = curr_price
-                orders = [curr_order]
-
+                orders = {curr_id: curr_qty}
             else:
-                orders.append(curr_order)
-        
+                orders[curr_id] = curr_qty
+
         bids[price] = orders
+        del bids[-1]
+
+        price = -1
 
         for ask in data['asks']:
 
-            curr_price, curr_order = ask['limit_price'], ask['order_qty']
+            curr_price = ask['limit_price']
+            curr_qty = ask['order_qty']
+            curr_id = ask['order_id']
 
             if price != curr_price:
                 asks[price] = orders
                 price = curr_price
-                orders = [curr_order]
+                orders = {curr_id: curr_qty}
 
             else:
-                orders.append(curr_order)
+                orders[curr_id] = curr_qty
         
-        bids[price] = orders
+        asks[price] = orders
+        del asks[-1]
 
         return bids, asks
 
@@ -558,25 +647,23 @@ class KrakenL3Socket(KrakenSocket):
 
         checksum_str = ""
 
-        for price, qty in list(self.asks.items())[:10]:
+        for price, orders in list(self.asks.items())[:10]:
 
-            price = f"{price:.1f}"
-            qty = f"{qty:.8f}"
+            price = self._format_kraken_str(price, 1)
 
-            price = price.replace('.', '').lstrip('0')
-            qty = qty.replace('.', '').lstrip('0')
+            for qty in orders.values(): 
 
-            checksum_str += price + qty
+                qty = self._format_kraken_str(qty, 8)
+                checksum_str += price + qty
 
-        for price, qty in list(reversed(self.bids.items()))[:10]:
+        for price, orders in list(reversed(self.bids.items()))[:10]:
 
-            price = f"{price:.1f}"
-            qty = f"{qty:.8f}"
+            price = self._format_kraken_str(price, 1)
 
-            price = price.replace('.', '').lstrip('0')
-            qty = qty.replace('.', '').lstrip('0')
+            for qty in orders.values():
+                qty = self._format_kraken_str(qty, 8)
 
-            checksum_str += price + qty
+                checksum_str += price + qty
 
         return checksum == crc32(checksum_str.encode('utf-8'))
 
