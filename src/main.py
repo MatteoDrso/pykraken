@@ -1,5 +1,9 @@
-from api.sockets import KrakenL3Socket
+from api.sockets import (
+    KrakenL1Socket,
+    KrakenL2Socket,
+    KrakenL3Socket
+)
 
-
-l1 = KrakenL3Socket('BTC/USD', depth=10)
+#example usage:
+l1 = KrakenL3Socket('BTC/USD', depth=100)
 l1.connect()
